@@ -34,7 +34,7 @@
 
 static struct {
     int wanted, loaded, active;
-    int fail;            // DLSSG_NO_FILES or DLSSG_NO_GPU when it was wanted and does not run (vk_dlssg_status)
+    int fail;            // DLSSG_NO_FILES or DLSSG_UNAVAILABLE when it was wanted and does not run (vk_dlssg_status)
     int mode, pending;   // generation as the driver has it, and the frames since the host asked for the other state
     int shown_mult;      // vk_dlssg_multiplier: the frames per game frame as last handed to the DLL (1 while off)
     PFN_nx2sl_frames_max frames_max;   // NULL with an older DLL, which generates one frame
@@ -42,6 +42,7 @@ static struct {
     PFN_nx2sl_instance_proc gipa;
     PFN_nx2sl_device_proc gdpa;
     PFN_nx2sl_available available;
+    PFN_nx2sl_log_unavailable log_unavailable;
     PFN_nx2sl_frame frame;
     PFN_nx2sl_present_marker marker;
     PFN_nx2sl_sleep sleep;
@@ -103,6 +104,7 @@ int vk_dlssg_early(void) {
     S.gipa = (PFN_nx2sl_instance_proc)(void *)GetProcAddress(m, "nx2sl_instance_proc");
     S.gdpa = (PFN_nx2sl_device_proc)(void *)GetProcAddress(m, "nx2sl_device_proc");
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
+    S.log_unavailable = (PFN_nx2sl_log_unavailable)(void *)GetProcAddress(m, "nx2sl_log_unavailable");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
     S.sleep = (PFN_nx2sl_sleep)(void *)GetProcAddress(m, "nx2sl_sleep");
@@ -151,10 +153,11 @@ VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDe
     return f ? f(pd, ci, NULL, out) : vkCreateDevice(pd, ci, NULL, out);
 }
 
-void vk_dlssg_device_ready(VkDevice dev) {
+void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {
     if (S.loaded <= 0) return;
     if (!S.available()) {
-        S.fail = DLSSG_NO_GPU;
+        S.fail = DLSSG_UNAVAILABLE;
+        if (S.log_unavailable) S.log_unavailable(physical);
         return;
     }
     PFN_vkGetDeviceProcAddr g = S.gdpa();
@@ -303,7 +306,11 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
         memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
         memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
-        k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
+        // the frame's own near and far planes (vk_dlaa.c proj_planes); nx2navi_dlssg.dll tells Streamline the depth is
+        // not inverted, which holds for every projection the game has shown (0 near, 1 far)
+        k.znear = c.znear, k.zfar = c.zfar, k.fov_y = c.fov_y, k.aspect = c.aspect;
+        static int told;
+        if (c.inverted && !told++) rt_log("dlssg: the scene's depth is inverted, which Streamline is not told");
         k.jitter[0] = jx, k.jitter[1] = jy;
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
         k.reset = reset;

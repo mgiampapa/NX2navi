@@ -20,6 +20,7 @@
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss_g.h>
+#include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
@@ -151,10 +152,20 @@ extern "C" NX2SL_API int nx2sl_available(void) {
     sl::DLSSGState s{};
     if (g_available && p_dlssg_state && p_dlssg_state(sl::ViewportHandle(0), s, nullptr) == sl::Result::eOk)
         g_max.store(s.numFramesToGenerateMax);
-    if (!g_available) say("dlssg: DLSS Frame Generation not available on this GPU or driver");
+    if (!g_available) say("dlssg: frame generation unavailable (DLSS-G plugin loaded: %d, DLSS-G options: %d, PCL marker: %d)",
+                          loaded, p_dlssg_options != nullptr, p_marker != nullptr);
     else if (g_max.load()) say("dlssg: DLSS Frame Generation available, up to %ux", g_max.load() + 1);
     else say("dlssg: DLSS Frame Generation available (its most frames per rendered frame not reported yet)");
     return g_available;
+}
+
+extern "C" NX2SL_API void nx2sl_log_unavailable(VkPhysicalDevice physical) {
+    auto supported = proc<PFun_slIsFeatureSupported>("slIsFeatureSupported");
+    if (!supported) return say("dlssg: Streamline has no adapter support query");
+    sl::AdapterInfo adapter{};
+    adapter.vkPhysicalDevice = physical;
+    sl::Result r = supported(sl::kFeatureDLSS_G, adapter);
+    say("dlssg: Streamline's support check for frame generation: %s (%d)", sl::getResultAsStr(r), (int)r);
 }
 
 // Streamline sets Reflex's mode on the swapchain it was told of last (VK_NV_low_latency2) and drops it while there is
@@ -232,6 +243,12 @@ extern "C" NX2SL_API int nx2sl_frame(VkCommandBuffer cb, const Nx2SlImage *depth
         sl::DLSSGOptions o{};
         o.mode = n ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
         o.numFramesToGenerate = n ? (uint32_t)n : 1;
+        // Generation goes off for every menu, cutscene and frame without depth and motion, and on again after it. Off
+        // frees the generator's resources unless this flag is set, and on allocates them again inside the present, with
+        // the queue lock held: a frame of 100 to 150 ms each time, the submitting thread waiting for that lock. With
+        // the flag, off only suspends. Whether frame generation runs at all is fixed for the run (vk_dlssg.c), so
+        // nothing is held for long that would otherwise be given back; Streamline frees it at shutdown.
+        o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
         sl::Result r = p_dlssg_options(vp, o);
         if (n) say("dlssg: frame generation on, %dx (%d generated per rendered frame) (%d), output %ux%u", n + 1, n, (int)r, out_w, out_h);
         else say("dlssg: frame generation off (%d), output %ux%u", (int)r, out_w, out_h);

@@ -75,7 +75,7 @@ Source shorthands:
 | 3.10 | **BFE / BFI fields past bit 31** (as PTX `bfe` / `bfi`): a field that runs past bit 31 is cut there; one that starts past it extracts 0 (signed: bit 31 repeated) and inserts nothing. Terrain vertex shaders (42 variants) have taken the position from a register, `((2y + x) * 8) & 0xff` with 5-bit x and y, so up to 248. | `OpBitField*Extract` / `OpBitFieldInsert` undefined when offset or offset + count exceeds 32; AMD's bitfield instructions take offset and width modulo 32. | The translator passes the fields through. Terrain walls and ground went missing on the Steam Deck and a Linux RX 570 (RADV). Ours: clamped where the field is not a constant inside the word (translator patch 0012). RX 9070 on Windows drew the terrain the same before and after. | PTX ISA `bfe`, `bfi` |
 | 3.11 | **SHF by 0** gives the unshifted word (C for `SHF.L`, A for `SHF.R`). | The translator's funnel shifts the other word by 32: undefined in SPIR-V; AMD shifts take the low 5 bits and give A \| C. | Gives terrain gaps at a distance. Ours: a select on a zero amount (translator patch 0013). In the shaders checked, every register SHF pairs its word with 0, so the result was right already. | — |
 | 3.12 | **Registers read before any write** on a path (paths the structurizer adds included) have no defined value in the game's code; the NVIDIA driver has been reported to give 0. | An `OpVariable` without an initializer loads an undefined value; Mesa folds undefined values freely. | Ours: every function-local variable starts at 0 (`OpConstantNull`, job flag `zero_locals`, translator patch 0016) on every driver; `NX2NAVI_ZERO_LOCALS=0` turns it off. On NVIDIA an undefined read takes another warp lane's value: Ocarina's clustered-light loop lit its floors in 4x8-pixel tiles (one warp each) and darkened Link. It was off while DLAA was on, because zeroing moves the SPIR-V hash of the game's FXAA shader that `vk_dlaa.c` `vk_dlaa_skip_draw` matches (`FXAA_FS` holds the zeroed hash too); with it off the tiles showed under DLSS and DLAA, and the shader cache keys, which include the flag, changed with the upscaler, so shaders prepared with one setting missed under the other. Checked on an RTX 5090: zeroed, DLAA keeps its camera motion (`NX2NAVI_MV_CHECK`) and the floor is clean. | — |
-| 3.13 | **NaN, infinity and signed zero follow IEEE 754**, and the game's code leans on them: its compiler writes an unordered comparison as `x > c \|\| isnan(x)`, a normalisation of a zero-length vector gives an infinity that a later test catches, and integer masks (0xffffffff) pass through float moves and selects. | SPIR-V without the `SignedZeroInfNanPreserve` execution mode lets the driver assume that no float is NaN or infinite. AMD's compilers act on it; NVIDIA's driver keeps the IEEE results. | The isnan tests of the game and of the translator (patches 0027, 0031) are only safe with the mode. On an RX 9070 XT a select between 1 and the bits 0xffffffff, converted as a signed integer, gave 2^32 instead of -1 and blew shadow casters up (issue #156); RX 6000 cards drew black and white blocks on Navi and on Link next to her (#41, #110); AMD GPUs drew Navi's sparkles without her orb. Ours: `vk_pipeline.c` `spirv_nan_preserve` adds the mode for 32-bit floats (16 and 64 where the module declares them and the driver can) when the module is created, on every driver except NVIDIA's (`NX2NAVI_VK_NAN_PRESERVE`). | VKSPEC (SPIR-V environment, precision and operation of SPIR-V instructions) |
+| 3.13 | **NaN, infinity and signed zero follow IEEE 754**, and the game's code leans on them: its compiler writes an unordered comparison as `x > c \|\| isnan(x)`, a normalisation of a zero-length vector gives an infinity that a later test catches, and integer masks (0xffffffff) pass through float moves and selects. | SPIR-V without the `SignedZeroInfNanPreserve` execution mode lets the driver assume that no float is NaN or infinite. AMD's compilers act on it; NVIDIA's driver keeps the IEEE results. | The isnan tests of the game and of the translator (patches 0027, 0031) are only safe with the mode. On an RX 9070 XT a select between 1 and the bits 0xffffffff, converted as a signed integer, gave 2^32 instead of -1 and blew shadow casters up (issue #156); RX 6000 cards drew black and white blocks on Navi and on Link next to her (#41, #110); AMD GPUs drew Navi's sparkles without her orb. Ours: `vk_pipeline.c` `spirv_nan_preserve` adds the mode for 32-bit floats (16 and 64 where the module declares them and the driver can) when the module is created, on every driver except NVIDIA's (`NX2NAVI_VK_NAN_PRESERVE`). On AMD's Windows driver for RDNA 1 and 2 ("AMD proprietary shader compiler", `vk_caps.amd_sc`), where the black and white blocks were reported, `spirv_nan_bits` also turns every 32-bit `OpIsNan` into an integer test of its bits and a float select with a NaN-bits constant into a select of the bits, which no float assumption can change (`NX2NAVI_VK_NAN_BITS`). | VKSPEC (SPIR-V environment, precision and operation of SPIR-V instructions) |
 
 ## 4. Memory model
 
@@ -88,7 +88,9 @@ Source shorthands:
 | 4.5 | **GPU-written index buffers** (8-bit indices written earlier in the same submission). | No `uint8` index type without `VK_EXT_index_type_uint8`; CPU widening reads stale bytes. | Widening on the GPU avoids it. Ours: CPU widening at record time; device-local byte indices skipped (check 9). | — |
 | 4.6 | **Compute shared memory**: 48 KiB per block on GM20B. | AMD 64 KiB. | Ours: `QueryComputeSharedMemorySize` from job (`Program.cs`). | OGD `clb1c0.h` |
 | 4.7 | **Virtual memory pools** map physical pool pages; the same bytes reachable at two GPU addresses. | Two `VkBuffer`s over one allocation need alias-aware barriers. | — | — |
+| 4.8 | **Events gate queues**: a command buffer's `WaitEvent` holds its queue until a `SignalEvent` of another queue, or `nvnEventSignal` on the CPU, gives the event the value; the GPU reads what the commands behind the wait use only from then on. Ocarina's worker queues wait for the main queue's signals and the other way round, and the main queue waits each frame for a signal the CPU gives once the game has written the frame's data, before, after or during the main queue's submit call. | One queue in submission order, and the replay copies what a submission reads (VRAM mirror sync, uniform snapshot) when its recording starts. | A wait reached before its signal stops its submission, which goes on when the signal has been replayed (`vk_exec.c`, "event order across the game's queues"). A CPU signal counts for a submission only when it came before those copies; one that comes during the replay stops the submission, and it goes on at once in a submission of its own (`vk_exec_xfer.c`, "events the CPU signals"). Passing the wait on it drew single frames from copies taken before the game had finished writing: the scene's shadowing missing or the scene black, the interface as it was. | — |
 | 4.8 | **Command list calls**: a `CallCommands` / `CallList` is not a GPU subroutine. A call is stored as a control entry; at submit the CPU walks the entries and recurses into the called list, emitting gpfifo entries that point at the command words, which the GPU fetches later (prefetch can be switched off per entry). So list structure is fixed at submit, command words are read when fetched. | n/a | Ours: `OP_CALL` is walked at replay, `CallCommands` inlines the recording at record time (`vk_exec.c` `walk`, `nvn_api_cmd.c` `inline_recording`). Equivalent for control flow; deferred bind handles are the data read late (2.4). | — |
+| 4.9 | **The texture pool is read as the GPU goes** (bindless `TEX.B` handles index it), and the GPU runs a submission right after it is submitted, so it sees the pool as of about the submit; Ocarina registers the next submission's textures right after submitting. | A descriptor a pending command buffer may read must not be updated (update-after-bind allows only unused ones), and on RADV a view of memory allocated after a submit is not in that submit's page tables. | A replay part handed to the queue early (`NX2NAVI_SPLIT_DRAWS`) kept reading the set later parts wrote: GPU page fault (`gfxhub`, TCP read) on the 128×128 probe pass of Kokiri Forest's first world frame, about 40 s in, nearly every run on RX 9070 XT. Ours: one pool set per submission from a ring, sealed when a part goes; the next sync that has entries to write takes another set, and no part is split off while every other set belongs to the same submission (`vk_exec_draw.c` `vk_exec_pool_split`, `pool_take_set`). | — |
 
 ## 5. Fixed function
 
@@ -115,8 +117,18 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
    `provokingVertexLast` and chains `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT{LAST_VERTEX}` in
    `create_graphics`; without the feature it logs that flat outputs come from the first vertex. **Fixed.**
 2. **Unwritten vertex outputs.** `spirv_add_outputs` (`vk_pipeline.c`) adds outputs initialised to (0, 0, 0, 1) for
-   FS inputs the VS lacks. Our translator never links stages, so its `InitializeVertexOutputs` would initialise
-   no user output; translator patch 0006 initialises the unlinked outputs. **Fixed.**
+   FS inputs the VS lacks. `gfx_shader.c` reflects the full declared location span of VS output and FS input arrays,
+   not just their base location: an FS `vec4[16]` requires all 16 locations even when it only accesses some elements.
+   The same reflected mask feeds recorded-pipeline prewarm, independent stage-library unions and direct pipeline builds.
+   Our translator never links stages, so its `InitializeVertexOutputs` would initialise no user output;
+   translator patch 0006 initialises the unlinked outputs. Mesh programs: a component of a position or generic vector
+   that the program's output map leaves out is written as (0, 0, 0, 1) by the mesh entry function
+   (`tools/xlate/MeshSpirv.cs`) and by the fallback's vertex stage (`runtime/mesh_fb.c` `meshfb_vs`); a whole location
+   the fragment stage reads and the mesh program does not write is filled in the fragment module of the mesh pipeline
+   (`vk_pipeline.c` `spirv_fs_fill_inputs`): (0, 0, 0, 1), or for a mesh program that draws points the point sprite's
+   coordinate (s, t, 0, 1): the fragment shaders recorded with two of the game's point-drawing mesh programs read
+   location 5, which those programs never write.
+   **Implemented; array-span runtime validation pending.**
 3. **Masked clears.** `vk_exec.c` skips colour clears with a partial channel mask (`W_CLEAR_MASK`); `clear_ds` skips stencil
    clears with a partial mask (`W_STENCIL_MASK`). NX2navi issues such clears. Check the log for
    `colour clear with channel mask` and `stencil clear with mask`. The hardware recipe (1.3) shows what the replay must do: colour clear = scissor 0 + channel mask, stencil clear = `value & mask` merged under the front write mask; so a draw with `colorWriteMask` / `stencilWriteMask` set to the clear mask is the exact equivalent. **Missing.**
@@ -154,7 +166,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     black; integer formats use the float path. Confirm the RX 9070 reports the feature (grass map needs 0.5).
     **OK if supported.**
 12. **Dual-source blend.** `vk_pipeline.c` `blend_factor` maps SRC1 factors; `Program.cs` `QueryGraphicsState` always passes
-    `dualSourceBlendEnable = false`, so no `Index 1` output exists. Log pipelines with SRC1 factors. **Mismatch if used.**
+    `dualSourceBlendEnable = false`, so no `Index 1` output exists in the translation. `vk_pipeline.c` gives a
+    pipeline whose blend state uses a SRC1 factor (`uses_src1`, `GKey.dsb`) a fragment module with the second output
+    at `Index 1` (`spirv_dual_source`) where the device has `dualSrcBlend`. **Fixed** (checked in the code on
+    2026-11-12, not by a capture).
 13. **FMZ / NaN.** Count `FMUL/FFMA/FMUL32I/FFMA32I` words with the `Fmz` field set (`Decoders/InstDecoders.cs:1901`
     bit positions) in `build/v121/shaders/`; FMin/FMax/FClamp NaN results are undefined (3.1). Census (2026-10-22):
     FMZ in 1 instruction of 12397 shaders, FTZ in 12241 shaders, FMNMX in 7457. The translator emits GLSL.std.450
@@ -162,7 +177,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     where the driver keeps NaNs (3.13).
 14. **Point size / line width.** Census: `SetLineWidth 4.5` ~1/frame (2 line draws into a 144x144 R8 target),
     `SetPointSize 5` ~14/frame; 4 point VS rely on it. Point size: translator patch 0008 reads it from the support
-    buffer, **fixed**. Line width: 1 px, non-default values logged (`nvn_ext.c`), **mismatch, minor**.
+    buffer, **fixed**. Line width: recorded with the draw state (`nvn_api_cmd.c`, `OP_BIND_STATE` kind 7) and set as
+    dynamic state for draws of the line topology class (`vk_pipeline.c` `vk_pipeline_line_width`), held to the
+    device's `lineWidthRange`; 1 px on a device without `wideLines` and for triangles drawn in the line polygon mode.
+    **Implemented; not compared with the hardware's wide-line coverage.**
 15. **Block height.** `nvn_tex.c` truncates like NVN (2.1); every other step of the layout matches. **OK.**
 16. **Depth mode and clamp.** `vk_pipeline.c` `create_graphics` (`negativeOneToOne` from `nvn_depth_minus_w`, `depthClampEnable`
     from NVN state). Matches the hardware z maths (1.5) and clamp switch (1.6). **OK.**
@@ -171,7 +189,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
 19. **Viewport / scissor arrays.** Single viewport (`vk_exec_draw.c` `record_fixed`), extra scissors logged. Census: 0 differing. **OK.**
 
 20. **Depth-compare sampling in compute** (VUID-vkCmdDispatch-None-06479): one compute shader samples a 4x4 R32F
-    CPU-written placeholder through an R32_SFLOAT view with compare on, ~1/frame. Needs a D32 copy. **Minor.**
+    CPU-written placeholder through an R32_SFLOAT view with compare on, ~1/frame. Where the driver does not compare
+    the colour format, the dispatch samples a depth twin of the image, copied right before it (`vk_exec_draw.c`,
+    "depth twins"; R32_SFLOAT and R16_UNORM). **Fixed for compute passes**; a draw that samples such an image keeps
+    the colour view.
 21. **Report timestamps: unit and instant.** `write_counter` (`vk_exec_xfer.c`) writes host `ns * 12 / 625` (19.2 MHz
     ticks) at fence completion for every report; `nvnDeviceGetTimestampInNanoseconds` converts back with the same factor
     (`nvn_ext.c`). On the hardware, GPU ticks convert at 625/384 ns (614.4 MHz), TIMESTAMP is written when the ROP has retired
@@ -179,4 +200,8 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     (a) if the game's consumer scales raw report ticks with its own constant rather than the NVN conversion call, our
     19.2 MHz unit is 32x off from the hardware's; find that consumer before fixing the unit; (b) the delta needs
     `vkCmdWriteTimestamp2` with `TOP_OF_PIPE` for TIMESTAMP_TOP and `BOTTOM_OF_PIPE` for TIMESTAMP, per submission
-    segment, converted to whichever unit (a) shows. **Mismatch (instant); unit unverified.**
+    segment, converted to whichever unit (a) shows. **Mismatch (instant); unit unverified.** What it can change:
+    both differences make the GPU time the game computes shorter than the hardware's (a report written at fence
+    completion spans less than top to bottom of the pipeline, and 19.2 MHz ticks read as 614.4 MHz ones are a
+    thirty-second), so an engine that lowers its resolution or detail under GPU load would stay at its highest
+    here. That is reasoning from the two units, not something measured; no picture difference is tied to it.
