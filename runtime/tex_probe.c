@@ -411,6 +411,51 @@ static int test_import(pool_t *pool) {
     return 0;
 }
 
+// The write-watch snapshot of many ranges at once (vk_memory.c vk_mem_snap_note_locked, vk_mem_snap_noted_locked), as
+// the texture pool's freshness check asks for it: ranges in three adjacent 2 MiB regions of the heap and in one apart,
+// noted in no address order, take one query per run of adjacent regions; afterwards every region has the epoch's
+// snapshot, the regions with a CPU write since `since` say so, the one without does not, and the pages are exact.
+// The bytes written are the ones already there, so the tests after this one find their memory as it was.
+static int test_snap_runs(uint8_t *h) {
+    static const uint32_t off[4] = {0xe10000, 0xa80000, 0x603000, 0x9f0000};   // regions at 14, 10, 6 and 8 MiB
+    uint64_t base = (uintptr_t)h;
+    GCHECK(!(base & 0x1fffff), "the heap at %#llx does not start on a 2 MiB region", (unsigned long long)base);
+    int left = -1;
+    uint32_t g0, now;
+    vk_texture_new_submit();
+    uint32_t ep = vk_texture_epoch();
+    vk_mem_gen_lock();
+    for (int i = 0; i < 4; i++) vk_mem_snap_note_locked(base + off[i], 0x2000, ep);
+    vk_mem_snap_noted_locked(ep, &left);   // what was written before this test
+    vk_mem_gen_unlock();
+    GCHECK(!left, "a run inside the heap was left to the queries by range");
+    vk_mem_changed(base + 0x200000, 0x1000, 0, &g0);
+    volatile uint8_t *w[3] = {h + 0xe10010, h + 0xa80800, h + 0x604000};
+    for (int i = 0; i < 3; i++) *w[i] = *w[i];
+    vk_texture_new_submit();
+    ep = vk_texture_epoch();
+    vk_mem_gen_lock();
+    for (int i = 0; i < 4; i++) vk_mem_snap_note_locked(base + off[i], 0x2000, ep);
+    for (int i = 0; i < 4; i++) vk_mem_snap_note_locked(base + off[i], 0x2000, ep);   // a region noted twice is asked once
+    uint64_t q = vk_mem_snap_noted_locked(ep, &left), again = 0;
+    int why[4];
+    for (int i = 0; i < 4; i++) {
+        why[i] = vk_mem_unchanged_why_locked(base + off[i], 0x2000, g0, ep);
+        again += vk_mem_snap_range_locked(base + off[i], 0x2000, ep);
+    }
+    vk_mem_gen_unlock();
+    GCHECK(q == 2 && !left, "four regions in two runs took %llu queries (left %d)", (unsigned long long)q, left);
+    GCHECK(!again, "%llu regions had no snapshot after the queries by run", (unsigned long long)again);
+    GCHECK(why[0] == 3 && why[1] == 3 && why[2] == 3 && why[3] == 0, "regions written, written, written, not written "
+           "answer %d %d %d %d", why[0], why[1], why[2], why[3]);
+    GCHECK(vk_mem_changed_snap(base + 0x604000, 0x1000, g0, ep, &now) == 1 &&
+           vk_mem_changed_snap(base + 0x603000, 0x1000, g0, ep, &now) == 0 &&
+           vk_mem_changed_snap(base + 0x9f0000, 0x2000, g0, ep, &now) == 0, "the pages written are not reported exactly");
+    printf("probe-vkmem: write-watch snapshot by runs: 4 regions in 2 runs took 2 queries; written regions and pages exact\n");
+    g_gpu_checks += 5;
+    return 0;
+}
+
 // A GPU write is noted on a pool, and the pool is finalized and made again at its address before the write is
 // reported: the report must leave alone what the CPU has written to the new pool since. With shadow storage the new
 // pool's shadow is a copy of guest memory from before those writes and holds no byte of the old write
@@ -436,6 +481,76 @@ static int test_remade(uint8_t *guest) {
     printf("probe-vkmem: a write reported for a pool that was made again leaves the CPU's newer bytes alone\n");
     g_gpu_checks += 2;
     return 0;
+}
+
+// A pool in the device address table gets its VRAM mirror while a guest submission is recorded, as on a draw's first
+// use of it as a buffer (vk_memory.c mirror_create). The table takes the mirror up by a store the GPU runs after the
+// mirror's first copy (vk_gpa.c vk_gpa_flip_cmd), so nothing is changed when the mirror is made; read from the table's
+// own memory once the submission is done, the pool's page reads the mirror and writes guest memory as well, and the
+// mirror holds the pool's bytes.
+static void mirror_use_record(VkCommandBuffer cb, void *arg) {
+    vk_texture_new_submit();
+    vk_mem_mirror_begin();
+    vk_mem_use(arg);
+    vk_mem_mirror_end(cb, vk_sync_issued() + 1);
+}
+
+static int test_table_mirror(uint8_t *guest) {
+    VkCtx *c = vk_ctx();
+    if (vk_mem_shadow_storage() || !vk_gpa_wanted()) {
+        printf("probe-vkmem: a new mirror in the device address table: skipped (%s)\n",
+               vk_mem_shadow_storage() ? "shadow storage, no mirrors" : "no device address table");
+        return 0;
+    }
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x24, .mem = guest + 0xD00000, .size = 0x10000,
+                   .game_mem = guest + 0xD00000};
+    volatile uint32_t *w = (volatile uint32_t *)(pool.mem + 0x3000);
+    uint64_t a = (uintptr_t)w, f0 = 0, t0 = 0, f1 = 0, t1 = 0, fm = 0, tm = 0;
+    *w = 0x600DF00Du;
+    GCHECK(vk_gpa_on() && vk_pool_init(&pool), "a CPU-visible pool in the device address table");
+    VkBuffer sb;
+    VmaAllocation sa;
+    volatile uint32_t *s = vk_staging(0x1000, &sb, &sa);
+    VkMemSpan sp;
+    int bad = 1;
+#define TM_CHECK(cond, ...) do { if (!(cond)) { printf("probe-vkmem: FAIL table mirror: "); printf(__VA_ARGS__); printf("\n"); goto done; } } while (0)
+    TM_CHECK(vk_mem_lookup(a, 4, &sp) && sp.buffer && sp.pool, "the pool has no buffer");
+    VkBuffer imported = sp.buffer;
+    TM_CHECK(vk_gpa_probe(a, &f0, &t0) && f0 == t0 && f0 == vk_gpa_device_address(imported) + sp.offset,
+             "before a mirror the table gives %#llx / %#llx for the pool's page, expected its imported buffer twice",
+             (unsigned long long)f0, (unsigned long long)t0);
+    uint64_t fence = vk_sync_submit_own(mirror_use_record, &sp);
+    // read while the submission may still be in flight: the table as the CPU left it when the mirror was made
+    int mid = vk_gpa_probe(a, &fm, &tm);
+    TM_CHECK(vk_sync_fence_wait(fence, 5000000000ull), "fence timed out");
+    if (sp.buffer == imported) {
+        printf("probe-vkmem: a new mirror in the device address table: skipped (the pool got no mirror)\n");
+        bad = 0;
+        goto done;
+    }
+    TM_CHECK(vk_gpa_probe(a, &f1, &t1), "the pool's page left the table");
+    if (vk_mem_gpa_late())   // else the table changes when the mirror is made, as up to 0.9.2
+        TM_CHECK(mid && (fm == f0 || fm == f1) && tm == f0, "while the submission ran the table gave %#llx / %#llx: neither "
+                 "the state before the store (%#llx twice) nor after it", (unsigned long long)fm, (unsigned long long)tm,
+                 (unsigned long long)f0);
+    TM_CHECK(f1 == vk_gpa_device_address(sp.buffer) + sp.offset, "after the submission the page reads %#llx, expected the "
+             "mirror's %#llx", (unsigned long long)f1, (unsigned long long)(vk_gpa_device_address(sp.buffer) + sp.offset));
+    TM_CHECK(t1 == f0, "after the submission the page's twin is %#llx, expected the imported buffer's %#llx",
+             (unsigned long long)t1, (unsigned long long)f0);
+    copy_wait(sp.buffer, sp.offset, sb, 0, 4);
+    vmaInvalidateAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
+    TM_CHECK(s[0] == 0x600DF00Du, "the mirror holds %#010x, expected the pool's 0x600df00d", s[0]);
+    g_gpu_checks += 4;
+    printf("probe-vkmem: a pool that gets its mirror in a recorded submission: the device address table names the mirror "
+           "after it, with guest memory as the twin (%s)\n",
+           vk_mem_gpa_late() ? "by a store in queue order, after the mirror's first copy" : "changed at once, NX2NAVI_GPA_LATE=0");
+    bad = 0;
+done:
+    vk_sync_finish();
+    vmaDestroyBuffer(c->vma, sb, sa);
+    vk_pool_fini(&pool);
+#undef TM_CHECK
+    return bad;
 }
 
 // test_table_sync, test_table_store: a guest submission of one part that records nothing. bound: its record binds the
@@ -945,6 +1060,39 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     vk_texture_stats(NULL, NULL, &re1);
 #ifdef _WIN32   // elsewhere an import's pinning can mark pages written again without a CPU write: the count is not exact
     GCHECK(re1 == re0 + 1, "storage rewritten: %llu re-uploads (want 1)", (unsigned long long)(re1 - re0));
+    // The same bytes written again, so that every page of the storage shows a write. The texture is over 64 KiB: with
+    // NX2NAVI_TEX_SAME_BIG it is compared by content and left as it is, without the switch it is uploaded again. Other
+    // bytes upload either way, and the image holds them. After two comparisons in a row that found other bytes its
+    // uploads take no hash any more, so the same bytes written again then upload with the switch too.
+    {
+        int big = rt_knob("TEX_SAME_BIG", "0") == 1;
+        volatile uint8_t *sm = (volatile uint8_t *)t.mem;
+        uint64_t re2, re3, re4, re5;
+        GCHECK(t.L.size > (64u << 10), "the RGBA8 texture's storage is %llu bytes, not over 64 KiB", (unsigned long long)t.L.size);
+        for (uint64_t o = 0; o < t.L.size; o += 0x1000) sm[o] = sm[o];
+        if (read_back(&t, 0, lin, 1, "RGBA8 written again with its own bytes")) return 1;
+        vk_texture_stats(NULL, NULL, &re2);
+        GCHECK(re2 == re1 + (big ? 0 : 1), "the same bytes written again: %llu re-uploads (want %d)",
+               (unsigned long long)(re2 - re1), big ? 0 : 1);
+        if (fill_storage(&t, lin)) return 1;
+        for (unsigned lv = 0; lv < 3; lv++)
+            if (read_back(&t, lv, lin, 1, "RGBA8 rewritten after the comparison")) return 1;
+        vk_texture_stats(NULL, NULL, &re3);
+        GCHECK(re3 == re2 + 1, "other bytes after the comparison: %llu re-uploads (want 1)", (unsigned long long)(re3 - re2));
+        if (fill_storage(&t, lin)) return 1;
+        if (read_back(&t, 0, lin, 1, "RGBA8 rewritten a second time in a row")) return 1;
+        vk_texture_stats(NULL, NULL, &re4);
+        GCHECK(re4 == re3 + 1, "other bytes a second time: %llu re-uploads (want 1)", (unsigned long long)(re4 - re3));
+        for (uint64_t o = 0; o < t.L.size; o += 0x1000) sm[o] = sm[o];
+        if (read_back(&t, 2, lin, 1, "RGBA8 written again with its own bytes after two rewrites")) return 1;
+        vk_texture_stats(NULL, NULL, &re5);
+        GCHECK(re5 == re4 + 1, "the same bytes after two rewrites in a row: %llu re-uploads (want 1: no hash is taken any "
+               "more)", (unsigned long long)(re5 - re4));
+        printf("probe-vkmem: a texture over 64 KiB written again with its own bytes: %s (NX2NAVI_TEX_SAME_BIG=%d); other "
+               "bytes upload, and after two rewrites in a row the same bytes do too\n",
+               big ? "left as it is" : "uploaded again", big);
+        g_gpu_checks += 5;
+    }
 #endif
     if (read_back(&t, 1, lin, 0, "RGBA8 ReadTexels from storage")) return 1;
 
@@ -1270,7 +1418,7 @@ static int test_gpu(void) {
                    .size = 0x40000, .game_mem = h + 0x800000, .span = 0x40000};
     pool_t virt = {.magic = NVN_POOL_MAGIC, .flags = 0x2a1, .mem = (uint8_t *)(uintptr_t)(RT_GPU_VA_BASE + 0x200000000ull),
                    .size = 0x80000, .span = 0x80000};
-    if (test_import(&pool) || test_readfile(pool.mem + 0x38000) || test_virtual(&phys, &virt)) return 1;
+    if (test_import(&pool) || test_readfile(pool.mem + 0x38000) || test_snap_runs(h) || test_virtual(&phys, &virt)) return 1;
     GCHECK(vk_pool_init(&tpool), "vk_pool_init of the texture pool");
     if (test_textures(&tpool, &phys) || test_stale_kept(&tpool)) return 1;
     pool_t dpool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = h + 0x500000, .size = 0x100000, .game_mem = h + 0x500000};
@@ -1288,7 +1436,7 @@ static int test_gpu(void) {
     vk_mem_stats(&st);
     GCHECK(!st.imported_pools && !st.physical_pools && !st.virtual_pools, "pools left after fini");
     g_gpu_checks += 2;
-    return test_table_sync(h) || test_table_store(h) || test_remade(h);
+    return test_table_sync(h) || test_table_store(h) || test_remade(h) || test_table_mirror(h);
 }
 
 int probe_vkmem(void) {
